@@ -1,0 +1,156 @@
+USE [data_monitor]
+GO
+/****** Object:  StoredProcedure [dbo].[monitor_data_structure_check]    Script Date: 29/08/2019 10:32:07 ******/
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+
+
+ALTER PROCEDURE [dbo].[monitor_data_structure_check](@monitor_date char(10))   
+ AS    
+declare @last_version_date char(10)
+BEGIN
+
+select @last_version_date=max(monitor_date) from monitor_table_infoAndcount where monitor_date<@monitor_date;
+
+if @last_version_date is not NULL 
+begin
+
+DELETE monitor_result_table_changed where monitor_date=@monitor_date;
+DELETE monitor_result_column_changed where monitor_date=@monitor_date;
+DELETE monitor_date_version where monitor_date=@monitor_date;
+
+insert into monitor_date_version
+select @monitor_date,@last_version_date,'N',getdate()
+
+insert into monitor_result_table_changed
+select distinct *
+--into monitor_result_table_changed
+from(
+select @monitor_date monitor_date,@last_version_date last_version_date,isnull(tt1.table_name,tt2.table_name) table_name,
+case when tt1.table_name is null then 'drop table "'+tt2.table_name +'"'
+when tt2.table_name is null then 'add table "'+tt1.table_name+'"'
+when tt1.rowscount<>tt2.rowscount then 'table "' +tt1.table_name +'": rows count is changed from ' +convert(varchar,tt2.rowscount) +' to '+convert(varchar,tt1.rowscount)
+end table_changed_content,
+case when tt1.table_name is null then 'drop'
+when tt2.table_name is null then 'add'
+when tt1.rowscount<>tt2.rowscount then 'reload'
+end table_changed_type,
+isnull(tt1.rowscount,0) monitor_rowscount,isnull(tt2.rowscount,0) last_version_rowscount
+from(
+select * from monitor_table_infoAndcount t1 where monitor_date=@monitor_date)tt1
+FULL outer join
+(
+select * from monitor_table_infoAndcount t1 where monitor_date=@last_version_date)tt2
+on tt1.table_name=tt2.table_name
+)t
+where table_changed_type is not null;
+
+
+insert into monitor_result_column_changed
+select  distinct *
+--into monitor_result_column_changed
+from(
+select @monitor_date monitor_date,@last_version_date last_version_date,
+isnull(tt1.table_name,tt2.table_name) table_name, isnull(tt1.column_name,tt2.column_name) column_name,
+case when tt1.column_name is null then 'drop column "' + tt2.column_name +'", type: '+tt2.column_type
+when  tt2.column_name is null then 'add column "' + tt1.column_name +'", type: '+ tt1.column_type
+when tt1.column_type<>tt2.column_type then 'column "' + tt1.column_name +'": alter type from ' +tt2.column_type + ' to ' + tt1.column_type
+end column_changed_content,
+case when tt1.column_name is null then 'drop'
+when  tt2.column_name is null then 'add'
+when tt1.column_type<>tt2.column_type then 'modify'
+end column_changed_type,
+isnull(tt1.column_type,'NULL') monitor_column_type,isnull(tt2.column_type,'NULL') last_version_column_type
+from(
+select t1.* from monitor_table_structure t1 where monitor_date=@monitor_date)tt1
+FULL outer join
+(
+select * from monitor_table_structure t1 where monitor_date=@last_version_date)tt2
+on tt1.table_name=tt2.table_name and tt1.column_name=tt2.column_name
+)t
+where column_changed_type is not null;
+
+
+
+delete from monitor_result_table_changed where table_name in(select table_name from monitor_table_without where need_monitor='N') and monitor_date=@monitor_date;
+delete from monitor_result_column_changed where  table_name in(select table_name from monitor_table_without where need_monitor='N') and monitor_date=@monitor_date;
+
+
+insert into monitor_result_table_changed(monitor_date,last_version_date,table_name,table_changed_content,table_changed_type)
+select distinct t1.monitor_date,t1.last_version_date,t1.table_name,'the structure of table "'+t1.table_name +'" was modified' table_changed_content,'modify' table_changed_type 
+from monitor_result_column_changed t1
+where not exists(select 1 from monitor_result_table_changed t2 where t1.monitor_date=t2.monitor_date and t1.table_name=t2.table_name 
+--and t2.table_changed_type  in('add','drop')
+) and  t1.monitor_date=@monitor_date;
+
+update monitor_result_table_changed
+set table_changed_type='modify',table_changed_content='the structure of table "'+t1.table_name +'" was modified'
+from monitor_result_table_changed t1
+where exists(select 1 from monitor_result_column_changed t2 where t1.monitor_date=t2.monitor_date and t1.table_name=t2.table_name ) and t1.table_changed_type='reload'
+and t1.monitor_date=@monitor_date;
+
+update monitor_result_table_changed
+set monitor_rowscount=t2.rowscount
+from monitor_result_table_changed t1,monitor_table_infoAndcount t2
+where t1.monitor_date=t2.monitor_date and  t1.table_name=t2.table_name  and t1.table_changed_type='modify'
+and t1.monitor_date=@monitor_date;
+
+
+update monitor_result_table_changed
+set last_version_rowscount=t2.rowscount
+from monitor_result_table_changed t1,monitor_table_infoAndcount t2
+where t1.last_version_date=t2.monitor_date and  t1.table_name=t2.table_name  and t1.table_changed_type='modify'
+and t1.last_version_date=@last_version_date;
+
+
+
+delete monitor_result_value_exception from monitor_result_value_exception t 
+where exists(select 1 from special_column_correction_mapping where status_code=0 and table_name=t.table_name and column_name=t.column_name and source_value=t.exception_value)
+and monitor_date=@monitor_date;
+
+update monitor_result_value_exception
+set normal_value=t2.target_value,correction_state=t2.remark
+from monitor_result_value_exception t1,special_column_correction_mapping t2
+where t1.table_name=t2.table_name and t1.column_name=t2.column_name and t2.source_value=t1.exception_value and  t2.status_code<>0 
+and monitor_date=@monitor_date;
+
+update monitor_result_value_exception
+set Check_Condition=t3.check_desc 
+from monitor_result_value_exception t1 ,monitor_special_columns t3
+where t1.table_name=t3.table_name and t1.column_name=t3.column_name
+and monitor_date=@monitor_date;
+
+update monitor_result_value_exception
+set correction_state='Uncorrected'
+where correction_state is null
+and monitor_date=@monitor_date;
+
+update monitor_date_version set complete_flag='Y' where monitor_date=@monitor_date;
+
+
+END
+ELSE
+begin
+declare @cnt int
+set @cnt=0
+select @cnt=count(distinct monitor_date) from monitor_table_infoAndcount;
+IF @cnt=1
+begin 
+select 'There is only data of one day, needn''t to check the difference!'
+END
+ELSE IF @cnt=0
+BEGIN
+select 'There is no data!'
+END
+ELSE
+BEGIN
+select 'There is no data which is earlier than the version of "'+@monitor_date+'".'
+end 
+END
+
+end
+
+
+
